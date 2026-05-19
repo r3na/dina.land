@@ -119,14 +119,16 @@ canvas { display: block; width: 100%; height: 100%; cursor: default; }
     <div class="screen-title">Hungry Dina!</div>
     <div class="screen-subtitle">
       Steal dishes from the dinner table before the family eats them!<br>
-      Jump, climb, and devour everything! 
+      Jump, climb, devour everything — but watch out for chili, onion &amp; chocolate!
     </div>
     <button class="play-btn" id="play-btn">Play!</button>
     <div class="controls-hint">
-      ⌨️ Arrow keys / WASD to move &amp; jump · ⬇/S to poop · E to pee<br>
-      📱 Touch left/right to move, swipe up to jump, swipe down to poop
+      ⌨️ Arrows / WASD to move &amp; jump · ⬇/S poop · E pee · <b>B</b> bark! · P/Esc pause<br>
+      📱 Touch left/right to move · swipe up = jump · swipe down = poop · double-tap = bark
       <br>🐶 Walk near the water bowl to drink!
+      <br>🌶️🧅🍫 are bad for Dina — let the humans have those!
     </div>
+    <div id="start-highscore" style="margin-top:12px; color:#ffdd57; font-weight:700;"></div>
   </div>
   <div id="end-screen">
     <div class="dog-emoji" id="end-emoji">🐶</div>
@@ -165,18 +167,35 @@ const PEE_PER_DRINK = 25;
 const PEE_DURATION = 1.0;
 const DISH_INTERVAL_MIN = 1800;
 const DISH_INTERVAL_MAX = 3400;
+// Family AI reaction-delay window per fresh dish (ms). Lower = harder.
+const REACTION_DELAY_MIN = 450;
+const REACTION_DELAY_MAX = 950;
+// Chance a single spawn becomes a 2-dish burst (so the family has to split).
+const BURST_CHANCE = 0.28;
+// Chance a dish is a "penalty" food the dog should avoid.
+const PENALTY_CHANCE = 0.10;
+const PENALTY_POINTS = -15;
+// Bark: a quick distraction that briefly freezes the nearest human.
+const BARK_COOLDOWN = 4.0;
+const BARK_FREEZE_DURATION = 1.2;
+const BARK_RANGE = 280; // pre-scale px
+const HIGH_SCORE_KEY = 'dina_high_score_v1';
 
 
 // ---- GAME STATE ----
 let W, H, scale;
 let gameRunning = false;
+let isPaused = false;
+let debugMode = false;
 let gameTime = 0;
 let dogScore = 0;
 let manScore = 0;
 let womanScore = 0;
+let highScore = 0;
 let lastTime = 0;
 let dishTimer = 0;
 let nextDishIn = 2000;
+let pendingSpawns = []; // [{delay, count}] ticked in update; replaces setTimeout
 let comboCount = 0;
 let comboTimer = 0;
 let shakeTimer = 0;
@@ -192,6 +211,8 @@ let peeTimer = 0;
 let peeStreams = [];
 let girls = [];
 let fountainX, fountainY;
+let barkCooldown = 0;
+let barkFlash = 0; // visual pulse when barking
 
 // ---- SCENE GEOMETRY (recalculated on resize) ----
 let floor, tableTop, tableLeft, tableRight, tableBottom;
@@ -255,6 +276,39 @@ function sfxFart() {
 function sfxDrink() { playSound(500, 0.08, 'sine', 0.06); setTimeout(()=>playSound(600, 0.1, 'sine', 0.05), 80); }
 function sfxPeeFull() { playSound(200, 0.15, 'triangle', 0.06); playSound(160, 0.15, 'triangle', 0.06); }
 function sfxCry() { playSound(800, 0.12, 'sine', 0.15); setTimeout(()=>playSound(700, 0.15, 'sine', 0.12), 200); setTimeout(()=>playSound(900, 0.1, 'sine', 0.1), 400); }
+function sfxBark() {
+  playSound(520, 0.08, 'square', 0.18);
+  setTimeout(()=> playSound(380, 0.12, 'square', 0.15), 70);
+  setTimeout(()=> playSound(300, 0.14, 'sawtooth', 0.10), 160);
+}
+
+function tryBark() {
+  if (!gameRunning || isPaused) return;
+  if (barkCooldown > 0) return;
+  if (isPooping || isPeeing) return;
+  barkCooldown = BARK_COOLDOWN;
+  barkFlash = 1;
+  sfxBark();
+  // Find nearest un-eating, un-frozen human within BARK_RANGE
+  const range = BARK_RANGE * scale;
+  let target = null, best = Infinity;
+  [familyMan, familyWoman].forEach(m => {
+    if (m.eating || m.freezeTimer > 0) return;
+    const d = Math.abs(m.x - dog.x);
+    if (d < range && d < best) { best = d; target = m; }
+  });
+  if (target) {
+    target.freezeTimer = BARK_FREEZE_DURATION;
+    target.reaching = false;
+    target.targetDish = null;
+    spawnFloatingText(target.x, target.y - 80 * scale, '😱 !!', '#ffdd57');
+    spawnParticles(target.x, target.y - 40 * scale, '#ffdd57', 8);
+  }
+  // Always show "WOOF!" above dog so player knows it triggered
+  spawnFloatingText(dog.x, dog.y - 80 * scale, 'WOOF!', '#7df9ff');
+  shakeTimer = 0.12;
+  shakeIntensity = 3;
+}
 
 // ---- RESIZE ----
 function resize() {
@@ -371,6 +425,7 @@ function resetFamily() {
     reaching: false,
     reachLean: 0,
     chewAnim: 0,
+    freezeTimer: 0,
   };
   familyWoman = {
     x: tableLeft + (tableRight - tableLeft) * 0.7,
@@ -383,15 +438,68 @@ function resetFamily() {
     reaching: false,
     reachLean: 0,
     chewAnim: 0,
+    freezeTimer: 0,
   };
 }
 
 // ---- DISH ----
-function spawnDish() {
-  const slotCount = 5;
-  const slotWidth = (tableRight - tableLeft - 60 * scale) / slotCount;
-  const slot = Math.floor(Math.random() * slotCount);
-  const x = tableLeft + 30 * scale + slot * slotWidth + slotWidth / 2;
+// Penalty foods: chili, onion, chocolate — humans eat them happily but
+// Dina shouldn't (bad for dogs / spicy).
+const PENALTY_TYPES = [
+  { type: '🌶️', label: 'TOO SPICY!' },
+  { type: '🧅', label: 'YUCK!' },
+  { type: '🍫', label: 'NO CHOCOLATE!' },
+];
+
+function spawnDish(opts) {
+  opts = opts || {};
+  // Random continuous position across the table (no fixed slots),
+  // with a slight bias toward the edges so food sometimes lands
+  // far from the family AI and close to the dog.
+  const margin = 40 * scale;
+  const tableSpan = (tableRight - tableLeft) - margin * 2;
+  let t = Math.random();
+  // S-curve bias toward edges: 0.3 chance to skew toward an end
+  if (Math.random() < 0.3) {
+    t = Math.random() < 0.5 ? t * 0.35 : 1 - t * 0.35;
+  }
+  // If we're spawning a burst pair, push the 2nd dish to the far half
+  // so the family has to split.
+  if (opts.burstPair) {
+    t = opts.burstPair === 'left' ? Math.random() * 0.35 : 0.65 + Math.random() * 0.35;
+  }
+  const x = tableLeft + margin + t * tableSpan;
+  // Reaction delay shrinks as game progresses (difficulty curve),
+  // floor at 200ms so the dog always gets *some* head-start.
+  const progress = 1 - (gameTime / GAME_DURATION); // 0 -> 1
+  const reactionMul = 1 - progress * 0.55;
+  const reactionDelay = Math.max(
+    200,
+    (REACTION_DELAY_MIN + Math.random() * (REACTION_DELAY_MAX - REACTION_DELAY_MIN)) * reactionMul
+  );
+
+  // Penalty dish?
+  const isPenalty = !opts.burstPair && Math.random() < PENALTY_CHANCE;
+  if (isPenalty) {
+    const p = PENALTY_TYPES[Math.floor(Math.random() * PENALTY_TYPES.length)];
+    dishes.push({
+      x: x,
+      y: tableTop - 10 * scale,
+      type: p.type,
+      label: p.label,
+      points: PENALTY_POINTS,        // dog: penalty
+      familyPoints: 8,                // humans still happily eat it
+      isPapaya: false,
+      isPenalty: true,
+      spawnAnim: 1,
+      wobble: 0,
+      stolen: false,
+      eaten: false,
+      reactionDelay: reactionDelay,
+    });
+    sfxDishArrive();
+    return;
+  }
   
   const types = ['🍗', '🍖', '🥩', '🍕', '🌮', '🍔', '🧁', '🥧', '🍰', '🍟', '🌭', '🥐', 'papaya'];
   const points = [10, 15, 20, 12, 12, 15, 25, 20, 25, 8, 10, 10, 50];
@@ -411,13 +519,24 @@ function spawnDish() {
     y: tableTop - 10 * scale,
     type: types[idx],
     points: points[idx],
+    familyPoints: points[idx],
     isPapaya: isPapaya,
+    isPenalty: false,
     spawnAnim: 1,
     wobble: 0,
     stolen: false,
     eaten: false,
+    reactionDelay: reactionDelay,
   });
   sfxDishArrive();
+}
+
+// Schedule a burst pair of dishes when desired
+function maybeBurst() {
+  if (Math.random() < BURST_CHANCE) {
+    pendingSpawns.push({ delay: 0.15, burstPair: 'left' });
+    pendingSpawns.push({ delay: 0.32, burstPair: 'right' });
+  }
 }
 
 // ---- PARTICLES ----
@@ -745,6 +864,21 @@ function drawPerson(person, isMan) {
   const y = person.y;
   const lean = person.reachLean || 0;
   const time = Date.now() / 1000;
+
+  // Frozen aura (drawn before transform so it's in world space)
+  if (person.freezeTimer > 0) {
+    const auraAlpha = 0.25 + 0.25 * Math.sin(time * 12);
+    ctx.save();
+    ctx.fillStyle = `rgba(125, 249, 255, ${auraAlpha})`;
+    ctx.beginPath();
+    ctx.arc(x, y - 55 * s, 55 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = `${22 * s}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('💫', x + Math.sin(time * 8) * 12 * s, y - 110 * s);
+    ctx.restore();
+  }
   
   ctx.save();
   ctx.translate(x, y);
@@ -2014,13 +2148,13 @@ function drawDishes() {
     ctx.translate(dish.x, dish.y + bounce);
     ctx.scale(spawnScale, spawnScale);
     
-    // Plate
-    ctx.fillStyle = dish.isPapaya ? '#fff4e0' : '#f8f4f0';
+    // Plate (penalty dishes get a warning-red rim)
+    ctx.fillStyle = dish.isPenalty ? '#ffe4e0' : (dish.isPapaya ? '#fff4e0' : '#f8f4f0');
     ctx.beginPath();
     ctx.ellipse(0, 6 * s, 22 * s, 6 * s, 0, 0, Math.PI * 2);
     ctx.fill();
-    ctx.strokeStyle = dish.isPapaya ? 'rgba(255,140,0,0.3)' : 'rgba(0,0,0,0.08)';
-    ctx.lineWidth = dish.isPapaya ? 2 : 1;
+    ctx.strokeStyle = dish.isPenalty ? 'rgba(200,40,40,0.6)' : (dish.isPapaya ? 'rgba(255,140,0,0.3)' : 'rgba(0,0,0,0.08)');
+    ctx.lineWidth = dish.isPenalty ? 2 : (dish.isPapaya ? 2 : 1);
     ctx.stroke();
     
     // Papaya glow
@@ -2082,10 +2216,34 @@ function drawDishes() {
     
     // Points indicator
     ctx.font = `bold ${10 * s}px sans-serif`;
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillText(`+${dish.points}`, 0, 18 * s);
+    ctx.fillStyle = dish.isPenalty ? 'rgba(255,120,120,0.85)' : 'rgba(255,255,255,0.6)';
+    ctx.fillText(dish.isPenalty ? `${dish.points}` : `+${dish.points}`, 0, 18 * s);
+
+    // Penalty warning label
+    if (dish.isPenalty) {
+      ctx.font = `bold ${9 * s}px sans-serif`;
+      ctx.fillStyle = '#ff4040';
+      ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+      ctx.lineWidth = 2 * s;
+      ctx.strokeText('⚠ NO DOG!', 0, -22 * s);
+      ctx.fillText('⚠ NO DOG!', 0, -22 * s);
+    }
     
     ctx.restore();
+
+    // Reaction-delay ring — drawn in world space (after restore) so it's not affected by spawnScale
+    if (dish.reactionDelay > 0) {
+      const maxDelay = REACTION_DELAY_MAX;
+      const frac = Math.min(1, dish.reactionDelay / maxDelay);
+      ctx.save();
+      ctx.strokeStyle = `rgba(125, 249, 255, ${0.35 + frac * 0.45})`;
+      ctx.lineWidth = 3 * s;
+      ctx.beginPath();
+      // Shrinks from full to zero as the AI "wakes up"
+      ctx.arc(dish.x, dish.y + bounce - 4 * s, (16 + 14 * frac) * s, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac);
+      ctx.stroke();
+      ctx.restore();
+    }
   });
 }
 
@@ -2286,22 +2444,58 @@ function update(dt) {
       nextDishIn *= Math.max(0.4, 1 - progress * 0.5);
       if (dishes.filter(d => !d.stolen && !d.eaten).length < 6) {
         spawnDish();
+        maybeBurst();
       }
     }
   }
+
+  // Tick pending spawn queue (replaces setTimeouts so it pauses with the game)
+  for (let i = pendingSpawns.length - 1; i >= 0; i--) {
+    pendingSpawns[i].delay -= dt;
+    if (pendingSpawns[i].delay <= 0) {
+      const spec = pendingSpawns[i];
+      pendingSpawns.splice(i, 1);
+      if (gameRunning) spawnDish({ burstPair: spec.burstPair });
+    }
+  }
+
+  // Bark cooldown tick + visual flash decay
+  if (barkCooldown > 0) barkCooldown = Math.max(0, barkCooldown - dt);
+  if (barkFlash > 0) barkFlash = Math.max(0, barkFlash - dt * 2);
+
+  // Family freeze timers
+  if (familyMan.freezeTimer > 0) familyMan.freezeTimer = Math.max(0, familyMan.freezeTimer - dt);
+  if (familyWoman.freezeTimer > 0) familyWoman.freezeTimer = Math.max(0, familyWoman.freezeTimer - dt);
+
+  // Family eating cooldown (replaces setTimeout(()=>{eating=false}, 1000))
+  if (familyMan.eating) {
+    familyMan.eatTimer -= dt;
+    if (familyMan.eatTimer <= 0) { familyMan.eating = false; familyMan.reaching = false; }
+  }
+  if (familyWoman.eating) {
+    familyWoman.eatTimer -= dt;
+    if (familyWoman.eatTimer <= 0) { familyWoman.eating = false; familyWoman.reaching = false; }
+  }
   
   // --- Dish updates ---
-  // First, assign family members to nearest available dishes
-  const activeDishes = dishes.filter(d => !d.stolen && !d.eaten);
+  // Tick down each dish's reaction-delay timer so the family AI
+  // ignores brand-new dishes for a short grace period (gives the dog a chance).
+  dishes.forEach(d => {
+    if (d.reactionDelay > 0) d.reactionDelay = Math.max(0, d.reactionDelay - dt * 1000);
+  });
   
-  // Reset family reaching state each frame
-  if (!familyMan.eating) { familyMan.reaching = false; familyMan.targetDish = null; }
-  if (!familyWoman.eating) { familyWoman.reaching = false; familyWoman.targetDish = null; }
+  // First, assign family members to nearest available dishes
+  // (only dishes past their reaction-delay are visible to the family AI).
+  const activeDishes = dishes.filter(d => !d.stolen && !d.eaten && d.reactionDelay <= 0);
+  
+  // Reset family reaching state each frame (frozen members keep their target frozen too)
+  if (!familyMan.eating && familyMan.freezeTimer <= 0) { familyMan.reaching = false; familyMan.targetDish = null; }
+  if (!familyWoman.eating && familyWoman.freezeTimer <= 0) { familyWoman.reaching = false; familyWoman.targetDish = null; }
   
   // Assign each family member to the closest available (unclaimed) dish
   const claimed = new Set();
   [familyMan, familyWoman].forEach(member => {
-    if (member.eating) return;
+    if (member.eating || member.freezeTimer > 0) return;
     let bestDish = null, bestDist = Infinity;
     activeDishes.forEach(dish => {
       if (claimed.has(dish)) return;
@@ -2317,10 +2511,10 @@ function update(dt) {
   });
   // If only one dish, let both go for it
   if (activeDishes.length === 1 && activeDishes[0]) {
-    if (!familyMan.eating && !familyMan.targetDish) {
+    if (!familyMan.eating && familyMan.freezeTimer <= 0 && !familyMan.targetDish) {
       familyMan.reaching = true; familyMan.targetDish = activeDishes[0]; familyMan.targetDishX = activeDishes[0].x;
     }
-    if (!familyWoman.eating && !familyWoman.targetDish) {
+    if (!familyWoman.eating && familyWoman.freezeTimer <= 0 && !familyWoman.targetDish) {
       familyWoman.reaching = true; familyWoman.targetDish = activeDishes[0]; familyWoman.targetDishX = activeDishes[0].x;
     }
   }
@@ -2331,6 +2525,11 @@ function update(dt) {
       // Slowly return to base position when done eating
       member.x += (member.baseX - member.x) * 0.03;
       member.reachLean *= 0.9;
+      return;
+    }
+    if (member.freezeTimer > 0) {
+      // Stunned by Dina's bark — wobble in place
+      member.reachLean = Math.sin(Date.now() / 60) * 0.4;
       return;
     }
     if (member.reaching && member.targetDish) {
@@ -2350,27 +2549,25 @@ function update(dt) {
       if (Math.abs(member.x - dish.x) < 30 * s && !dish.stolen && !dish.eaten) {
         dish.eaten = true;
         const isMan = member === familyMan;
+        const pts = dish.familyPoints != null ? dish.familyPoints : dish.points;
         if (isMan) {
-          manScore += dish.points;
+          manScore += pts;
           manPtsEl.textContent = manScore;
         } else {
-          womanScore += dish.points;
+          womanScore += pts;
           womanPtsEl.textContent = womanScore;
         }
         const memberColor = isMan ? '#5a9fd4' : '#ff6b9d';
         spawnParticles(dish.x, dish.y, memberColor, 6);
-        spawnFloatingText(dish.x, dish.y - 20 * s, `+${dish.points}`, memberColor);
+        spawnFloatingText(dish.x, dish.y - 20 * s, `+${pts}`, memberColor);
         sfxFamilyEat();
         shakeTimer = 0.15;
         shakeIntensity = 3;
         member.eating = true;
+        member.eatTimer = 1.0; // ticked down in update; no more setTimeout
         member.chewAnim = 0;
         member.reaching = false;
         member.targetDish = null;
-        setTimeout(() => {
-          member.eating = false;
-          member.reaching = false;
-        }, 1000);
       }
     } else {
       // No target — drift back to base
@@ -2391,36 +2588,51 @@ function update(dt) {
       const dist = Math.abs(dog.x - dish.x);
       if (dist < 45 * s) {
         dish.stolen = true;
-        dog.chewTimer = dish.isPapaya ? 1.2 : 0.8; // extra yummy for papaya!
-        poopMeter = Math.min(POOP_MAX, poopMeter + POOP_PER_STEAL);
-        if (poopMeter >= POOP_MAX) {
-          spawnFloatingText(dog.x, dog.y - 70 * s, '💩 BELLY FULL!', '#ff4444');
-          sfxPoopFull();
-        }
-        comboCount++;
-        comboTimer = 2;
-        const papayaBonus = dish.isPapaya ? 25 : 0;
-        const bonus = comboCount > 1 ? Math.floor(dish.points * 0.5 * comboCount) : 0;
-        const totalPts = dish.points + bonus + papayaBonus;
-        dogScore += totalPts;
-        dogPtsEl.textContent = dogScore;
-        
-        spawnParticles(dish.x, dish.y, dish.isPapaya ? '#ff8800' : '#ffdd57', dish.isPapaya ? 18 : 12);
-        if (dish.isPapaya) {
-          spawnFloatingText(dish.x, dish.y - 50 * s, '\uD83E\uDD6D PAPAYA! +' + totalPts, '#ff6600');
-          shakeTimer = 0.3;
-          shakeIntensity = 6;
-          playSound(1400, 0.15); setTimeout(()=>playSound(1600, 0.2, 'sine', 0.1), 100); setTimeout(()=>playSound(1800, 0.25, 'sine', 0.12), 200);
-        } else if (comboCount > 1) {
-          spawnFloatingText(dish.x, dish.y - 30 * s, `+${totalPts} COMBO x${comboCount}!`, '#ff9500');
-          sfxCombo();
-          shakeTimer = 0.25;
+
+        // --- Penalty dish: dog should have avoided it ---
+        if (dish.isPenalty) {
+          dog.chewTimer = 0.6;
+          dogScore += dish.points; // negative
+          dogPtsEl.textContent = dogScore;
+          comboCount = 0; // breaks combo
+          comboTimer = 0;
+          spawnParticles(dish.x, dish.y, '#d04030', 14);
+          spawnFloatingText(dish.x, dish.y - 30 * s, `${dish.label} ${dish.points}`, '#ff4040');
+          sfxCry();
+          shakeTimer = 0.2;
           shakeIntensity = 5;
         } else {
-          spawnFloatingText(dish.x, dish.y - 30 * s, `+${totalPts}`, '#ffdd57');
-          sfxSteal();
-          shakeTimer = 0.1;
-          shakeIntensity = 3;
+          dog.chewTimer = dish.isPapaya ? 1.2 : 0.8; // extra yummy for papaya!
+          poopMeter = Math.min(POOP_MAX, poopMeter + POOP_PER_STEAL);
+          if (poopMeter >= POOP_MAX) {
+            spawnFloatingText(dog.x, dog.y - 70 * s, '💩 BELLY FULL!', '#ff4444');
+            sfxPoopFull();
+          }
+          comboCount++;
+          comboTimer = 2;
+          const papayaBonus = dish.isPapaya ? 25 : 0;
+          const bonus = comboCount > 1 ? Math.floor(dish.points * 0.5 * comboCount) : 0;
+          const totalPts = dish.points + bonus + papayaBonus;
+          dogScore += totalPts;
+          dogPtsEl.textContent = dogScore;
+
+          spawnParticles(dish.x, dish.y, dish.isPapaya ? '#ff8800' : '#ffdd57', dish.isPapaya ? 18 : 12);
+          if (dish.isPapaya) {
+            spawnFloatingText(dish.x, dish.y - 50 * s, '\uD83E\uDD6D PAPAYA! +' + totalPts, '#ff6600');
+            shakeTimer = 0.3;
+            shakeIntensity = 6;
+            playSound(1400, 0.15); setTimeout(()=>playSound(1600, 0.2, 'sine', 0.1), 100); setTimeout(()=>playSound(1800, 0.25, 'sine', 0.12), 200);
+          } else if (comboCount > 1) {
+            spawnFloatingText(dish.x, dish.y - 30 * s, `+${totalPts} COMBO x${comboCount}!`, '#ff9500');
+            sfxCombo();
+            shakeTimer = 0.25;
+            shakeIntensity = 5;
+          } else {
+            spawnFloatingText(dish.x, dish.y - 30 * s, `+${totalPts}`, '#ffdd57');
+            sfxSteal();
+            shakeTimer = 0.1;
+            shakeIntensity = 3;
+          }
         }
       }
     }
@@ -2644,6 +2856,81 @@ function render() {
     ctx.restore();
     ctx.globalAlpha = 1;
   }
+
+  // Bark cooldown HUD (top-left)
+  if (gameRunning) {
+    const bx = 16 * scale, by = 90 * scale;
+    const ready = barkCooldown <= 0;
+    ctx.save();
+    ctx.globalAlpha = ready ? 0.95 : 0.55;
+    ctx.fillStyle = ready ? '#7df9ff' : '#445';
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 3 * scale;
+    ctx.font = `bold ${16 * scale}px sans-serif`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    const label = ready ? '🔊 BARK [B]' : `🔊 ${barkCooldown.toFixed(1)}s`;
+    ctx.strokeText(label, bx, by);
+    ctx.fillText(label, bx, by);
+    ctx.restore();
+
+    // Difficulty pips (top-right)
+    const progress = 1 - gameTime / GAME_DURATION;
+    const level = progress < 0.33 ? 1 : progress < 0.66 ? 2 : 3;
+    ctx.save();
+    ctx.font = `bold ${14 * scale}px sans-serif`;
+    ctx.textAlign = 'right';
+    ctx.fillStyle = level >= 3 ? '#ff5050' : level >= 2 ? '#ffaa00' : '#7dff7d';
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.lineWidth = 3 * scale;
+    const pip = '🐾'.repeat(level);
+    ctx.strokeText(`Difficulty ${pip}`, W - 16 * scale, 90 * scale);
+    ctx.fillText(`Difficulty ${pip}`, W - 16 * scale, 90 * scale);
+    ctx.restore();
+  }
+
+  // Debug overlay (~ to toggle)
+  if (debugMode) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(8 * scale, H - 130 * scale, 280 * scale, 120 * scale);
+    ctx.fillStyle = '#7df9ff';
+    ctx.font = `${12 * scale}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    const activeDish = dishes.filter(d => !d.stolen && !d.eaten).length;
+    const queued = pendingSpawns.length;
+    const minReact = Math.min(...dishes.map(d => d.reactionDelay || 0), 0);
+    const lines = [
+      `dishes active=${activeDish} queued=${queued}`,
+      `bark cd=${barkCooldown.toFixed(2)}s freezeM=${familyMan.freezeTimer.toFixed(2)} freezeW=${familyWoman.freezeTimer.toFixed(2)}`,
+      `nextDishIn=${nextDishIn.toFixed(0)}ms minReact=${minReact.toFixed(0)}ms`,
+      `gameTime=${gameTime.toFixed(2)}s paused=${isPaused}`,
+      `dog x=${dog.x.toFixed(0)} onTable=${dog.onTable}`,
+      `hi=${highScore} dog=${dogScore} fam=${manScore + womanScore}`,
+    ];
+    lines.forEach((l, i) => ctx.fillText(l, 16 * scale, H - 125 * scale + i * 16 * scale));
+    ctx.restore();
+  }
+
+  // Pause overlay
+  if (isPaused && gameRunning) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(10, 5, 30, 0.7)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.lineWidth = 5 * scale;
+    ctx.font = `bold ${72 * scale}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.strokeText('⏸ PAUSED', W / 2, H * 0.45);
+    ctx.fillText('⏸ PAUSED', W / 2, H * 0.45);
+    ctx.font = `${22 * scale}px sans-serif`;
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText('Press P or Esc to resume', W / 2, H * 0.55);
+    ctx.restore();
+  }
   
   ctx.restore();
 }
@@ -2653,7 +2940,7 @@ function gameLoop(timestamp) {
   const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
   lastTime = timestamp;
   
-  update(dt);
+  if (!isPaused) update(dt);
   render();
   
   requestAnimationFrame(gameLoop);
@@ -2668,6 +2955,7 @@ function startGame() {
   dishes = [];
   particles = [];
   floatingTexts = [];
+  pendingSpawns = [];
   dogScore = 0;
   manScore = 0;
   womanScore = 0;
@@ -2686,6 +2974,9 @@ function startGame() {
   isPeeing = false;
   peeTimer = 0;
   peeStreams = [];
+  barkCooldown = 0;
+  barkFlash = 0;
+  isPaused = false;
   gameRunning = true;
   resetGirls();
   
@@ -2699,13 +2990,14 @@ function startGame() {
   manPtsEl.textContent = '0';
   womanPtsEl.textContent = '0';
   
-  // Spawn initial dishes
-  setTimeout(() => { if (gameRunning) spawnDish(); }, 500);
-  setTimeout(() => { if (gameRunning) spawnDish(); }, 1200);
+  // Spawn initial dishes (queued — survives pauses)
+  pendingSpawns.push({ delay: 0.5 });
+  pendingSpawns.push({ delay: 1.2 });
 }
 
 function endGame() {
   gameRunning = false;
+  isPaused = false;
   scoreBar.style.display = 'none';
   endScreen.style.display = 'flex';
   
@@ -2714,22 +3006,58 @@ function endGame() {
   const endScores = document.getElementById('end-scores');
   
   const familyTotal = manScore + womanScore;
+  // Persist & detect new high score (dog only)
+  const isNewHigh = dogScore > highScore;
+  if (isNewHigh) {
+    highScore = dogScore;
+    try { localStorage.setItem(HIGH_SCORE_KEY, String(highScore)); } catch (e) { /* private mode */ }
+  }
+  const hiLine = isNewHigh
+    ? `<br><b style="color:#ffdd57">🏆 NEW HIGH SCORE: ${highScore}!</b>`
+    : `<br><small style="opacity:0.7">🏆 High score: ${highScore}</small>`;
+
   if (dogScore > familyTotal) {
     endEmoji.textContent = '🐶🎉';
     endResult.textContent = 'Dina Wins!';
     endResult.style.color = '#ffdd57';
-    endScores.innerHTML = `🐶 Dina: <b>${dogScore}</b> pts &nbsp;|&nbsp; 👨 <b>${manScore}</b> · 👩 <b>${womanScore}</b> (${familyTotal})<br><small>The fluffiest food thief strikes again!</small>`;
+    endScores.innerHTML = `🐶 Dina: <b>${dogScore}</b> pts &nbsp;|&nbsp; 👨 <b>${manScore}</b> · 👩 <b>${womanScore}</b> (${familyTotal})<br><small>The fluffiest food thief strikes again!</small>${hiLine}`;
   } else if (familyTotal > dogScore) {
     endEmoji.textContent = '👨‍👩‍🦮';
     endResult.textContent = 'Family Wins!';
     endResult.style.color = '#ff6b9d';
-    endScores.innerHTML = `👨 <b>${manScore}</b> · 👩 <b>${womanScore}</b> (${familyTotal}) &nbsp;|&nbsp; 🐶 Dina: <b>${dogScore}</b> pts<br><small>Better luck next dinner, Dina!</small>`;
+    endScores.innerHTML = `👨 <b>${manScore}</b> · 👩 <b>${womanScore}</b> (${familyTotal}) &nbsp;|&nbsp; 🐶 Dina: <b>${dogScore}</b> pts<br><small>Better luck next dinner, Dina!</small>${hiLine}`;
   } else {
     endEmoji.textContent = '🤝';
     endResult.textContent = "It's a Tie!";
     endResult.style.color = '#7df9ff';
-    endScores.innerHTML = `🐶 <b>${dogScore}</b> vs 👨 <b>${manScore}</b> · 👩 <b>${womanScore}</b> (${familyTotal})<br><small>Sharing is caring... sort of!</small>`;
+    endScores.innerHTML = `🐶 <b>${dogScore}</b> vs 👨 <b>${manScore}</b> · 👩 <b>${womanScore}</b> (${familyTotal})<br><small>Sharing is caring... sort of!</small>${hiLine}`;
   }
+}
+
+// ---- HIGH SCORE ----
+function loadHighScore() {
+  try {
+    const v = parseInt(localStorage.getItem(HIGH_SCORE_KEY) || '0', 10);
+    if (!isNaN(v) && v > 0) highScore = v;
+  } catch (e) { /* private mode */ }
+  const hiEl = document.getElementById('start-highscore');
+  if (hiEl) hiEl.textContent = highScore > 0 ? `🏆 Your best: ${highScore}` : '';
+}
+
+// ---- PAUSE ----
+function pauseGame(reason) {
+  if (!gameRunning || isPaused) return;
+  isPaused = true;
+}
+function resumeGame() {
+  if (!isPaused) return;
+  isPaused = false;
+  // Reset frame clock so dt doesn't spike after a long pause
+  lastTime = performance.now();
+}
+function togglePause() {
+  if (!gameRunning) return;
+  if (isPaused) resumeGame(); else pauseGame('manual');
 }
 
 // ---- INPUT HANDLERS ----
@@ -2738,14 +3066,28 @@ window.addEventListener('keydown', e => {
   if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) {
     e.preventDefault();
   }
+  if (e.code === 'KeyB') tryBark();
+  if (e.code === 'KeyP' || e.code === 'Escape') togglePause();
+  if (e.code === 'Backquote') debugMode = !debugMode;
 });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
 
+// Auto-pause when tab/window loses focus
+window.addEventListener('blur', () => pauseGame('blur'));
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) pauseGame('hidden');
+});
+
 // Touch controls
 let touchStartX = 0, touchStartY = 0;
+let lastTapTime = 0;
 canvas.addEventListener('touchstart', e => {
   e.preventDefault();
   initAudio();
+  // Double-tap anywhere = bark
+  const now = performance.now();
+  if (now - lastTapTime < 320) tryBark();
+  lastTapTime = now;
   for (const touch of e.changedTouches) {
     touchStartX = touch.clientX;
     touchStartY = touch.clientY;
@@ -2788,10 +3130,11 @@ canvas.addEventListener('mousedown', e => {
 });
 
 // ---- START ----
-document.getElementById('play-btn').addEventListener('click', startGame);
-document.getElementById('replay-btn').addEventListener('click', startGame);
+document.getElementById('play-btn').addEventListener('click', () => { startGame(); loadHighScore(); });
+document.getElementById('replay-btn').addEventListener('click', () => { startGame(); loadHighScore(); });
 
 // Initial render
+loadHighScore();
 lastTime = performance.now();
 requestAnimationFrame(gameLoop);
 </script>
